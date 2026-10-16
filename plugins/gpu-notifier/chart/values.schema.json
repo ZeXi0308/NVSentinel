@@ -5,6 +5,17 @@
   "properties": {
     "replicas": {"type": "integer", "enum": [0, 1]},
     "image": {"type": "string", "minLength": 1},
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {"type": "string", "minLength": 1, "maxLength": 253, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"}
+        }
+      }
+    },
     "cluster": {"type": "string"},
     "slackChannelId": {"type": "string"},
     "infraSlackIds": {"type": "string"}

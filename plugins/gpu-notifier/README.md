@@ -124,6 +124,8 @@ make -C plugins/gpu-notifier docker-build IMAGE=private.registry.example/gpu-not
 
 Publish through your private registry workflow, then deploy an immutable image digest. The plugin does not add an image-publishing workflow.
 
+`imagePullSecrets` references existing pull Secrets in the release namespace and defaults to an empty list. The Xinjiang override uses `meshy-acr`. The deployment repository manages that Secret separately through `nvsentinel-acr-pull.values.yaml`: its ExternalSecret uses `aws-secrets-manager` to sync `k8s/prod/infra/acr-bj-pull` into `nvsentinel/meshy-acr`. Prepare it before enabling the worker. This independent credential configuration does not require an upgrade of the main NVSentinel release.
+
 The independent chart contains a ServiceAccount, read-only Kubernetes RBAC, Deployment, client Certificate, and PodMonitor. Its default is zero replicas. Enabling one replica requires `cluster`, `slackChannelId`, and `infraSlackIds` values. The schema rejects missing notification destinations.
 
 The Xinjiang override preserves the existing pilot identifiers. From the repository root:

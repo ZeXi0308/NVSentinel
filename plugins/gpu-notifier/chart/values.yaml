@@ -1,6 +1,8 @@
 # Start paused; provision MongoDB and the worker Secret before enabling.
 replicas: 0
 image: REPLACE_WITH_PUBLISHED_IMAGE_DIGEST
+# Existing image-pull Secrets in the release namespace, for private registries.
+imagePullSecrets: []
 # A stable cluster identifier; changing it starts a different Mongo state scope.
 cluster: ""
 # Required when replicas is 1. Invite the bot and test owners to this channel.
