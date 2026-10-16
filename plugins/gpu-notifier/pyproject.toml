@@ -1,0 +1,35 @@
+[tool.poetry]
+name = "meshy-gpu-notifier"
+version = "0.1.0"
+description = "Independent Slack notifications for NVSentinel node faults"
+authors = ["Meshy"]
+packages = [{include = "app"}]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<4.0"
+httpx = "0.28.1"
+pymongo = "4.19.0"
+
+[tool.poetry.group.dev.dependencies]
+# Match .versions.yaml; Makefile checks this before linting.
+black = "26.3.1"
+coverage = "^7.13.5"
+pytest = "^9.0.3"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.black]
+line-length = 120
+target-version = ["py311"]
+
+[tool.coverage.run]
+source = ["app.gpunotify"]
+
+[tool.coverage.report]
+show_missing = true

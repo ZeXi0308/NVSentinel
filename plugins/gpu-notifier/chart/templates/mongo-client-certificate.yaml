@@ -1,0 +1,23 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: gpu-notifier-mongo-client
+  namespace: {{ .Release.Namespace }}
+spec:
+  secretName: gpu-notifier-mongo-client
+  commonName: gpu-notifier
+  subject:
+    organizations: [Meshy]
+    organizationalUnits: [GPU-Notifications]
+  duration: 2160h
+  renewBefore: 720h
+  usages: [client auth]
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    rotationPolicy: Always
+  additionalOutputFormats:
+    - type: CombinedPEM
+  issuerRef:
+    name: mongo-ca-issuer
+    kind: Issuer

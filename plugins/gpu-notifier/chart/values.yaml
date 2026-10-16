@@ -1,0 +1,9 @@
+# Start paused; provision MongoDB and the worker Secret before enabling.
+replicas: 0
+image: REPLACE_WITH_PUBLISHED_IMAGE_DIGEST
+# A stable cluster identifier; changing it starts a different Mongo state scope.
+cluster: ""
+# Required when replicas is 1. Invite the bot and test owners to this channel.
+slackChannelId: ""
+# Required when replicas is 1. Space-separated infra Slack user IDs.
+infraSlackIds: ""

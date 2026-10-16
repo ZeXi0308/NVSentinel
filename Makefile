@@ -61,7 +61,8 @@ GO_MODULES := \
 
 # Python modules
 PYTHON_MODULES := \
-	health-monitors/gpu-health-monitor
+	health-monitors/gpu-health-monitor \
+	plugins/gpu-notifier
 
 # Container-only modules
 CONTAINER_MODULES := \
@@ -416,6 +417,10 @@ python-lint-test-all:
 		echo "Processing $$module..."; \
 		$(MAKE) lint-test-$$module || exit 1; \
 	done
+
+.PHONY: lint-test-plugins/gpu-notifier
+lint-test-plugins/gpu-notifier:
+	$(MAKE) -C plugins/gpu-notifier lint-test
 
 # Individual non-health-monitor Go module lint-test targets
 .PHONY: lint-test-api

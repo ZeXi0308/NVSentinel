@@ -1,0 +1,5 @@
+# Keep these identifiers when moving the existing pilot to this plugin.
+cluster: xinjiang
+slackChannelId: C0C995HP9HT
+# Pilot infra escalation goes only to the requesting user.
+infraSlackIds: U0C7MB1DBJN

@@ -1,0 +1,9 @@
+**
+!pyproject.toml
+!poetry.lock
+!app/
+!app/**
+**/__pycache__/
+**/*.pyc
+**/.env
+**/.env.*

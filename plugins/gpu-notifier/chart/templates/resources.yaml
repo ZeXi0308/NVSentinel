@@ -1,0 +1,159 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gpu-notifier
+  namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gpu-notifier-observer
+rules:
+  - apiGroups: [""]
+    resources: [nodes, pods]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gpu-notifier-observer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gpu-notifier-observer
+subjects:
+  - kind: ServiceAccount
+    name: gpu-notifier
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gpu-notifier-circuit-breaker
+  namespace: {{ .Release.Namespace }}
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [circuit-breaker]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gpu-notifier-circuit-breaker
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gpu-notifier-circuit-breaker
+subjects:
+  - kind: ServiceAccount
+    name: gpu-notifier
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-notifier
+  namespace: {{ .Release.Namespace }}
+spec:
+  replicas: {{ .Values.replicas }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: gpu-notifier
+  template:
+    metadata:
+      labels:
+        app: gpu-notifier
+    spec:
+      serviceAccountName: gpu-notifier
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: mongo-client-tls
+          secret:
+            secretName: gpu-notifier-mongo-client
+            defaultMode: 0440
+            items:
+              - key: ca.crt
+                path: ca.crt
+              - key: tls-combined.pem
+                path: client.pem
+      containers:
+        - name: notifier
+          image: {{ .Values.image | quote }}
+          args: ["/app/.venv/bin/python", "-m", "app.gpunotify", "run", "--send", "--channel", {{ .Values.slackChannelId | quote }}]
+          env:
+            - name: GPU_NOTIFY_CLUSTER
+              value: {{ .Values.cluster | quote }}
+            - name: GPU_NOTIFY_BREAKER_NAMESPACE
+              value: {{ .Release.Namespace }}
+            - name: GPU_NOTIFY_MONGO_CERT_FILE
+              value: /etc/gpu-notifier-mongo/client.pem
+            - name: GPU_SLACK_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-notifier
+                  key: slack-bot-token
+            - name: GPU_NOTIFY_MONGO_URI
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-notifier
+                  key: mongo-uri
+            - name: GPU_NOTIFY_MONGO_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-notifier
+                  key: mongo-database
+            # Required for live mode: space-separated Slack user IDs.
+            - name: GPU_NOTIFY_INFRA_IDS
+              value: {{ .Values.infraSlackIds | quote }}
+          volumeMounts:
+            - name: mongo-client-tls
+              mountPath: /etc/gpu-notifier-mongo
+              readOnly: true
+          ports:
+            - name: metrics
+              containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+---
+# Xinjiang's VictoriaMetrics operator converts this to a VMPodScrape.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: gpu-notifier
+  namespace: {{ .Release.Namespace }}
+spec:
+  selector:
+    matchLabels:
+      app: gpu-notifier
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
