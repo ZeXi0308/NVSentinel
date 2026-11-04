@@ -626,7 +626,10 @@ var _ = Describe("Validation release readiness check", func() {
 		Expect(node.Annotations).NotTo(HaveKey(annotationActiveValidationRequest))
 		entries, err := parseSessionAnnotation(node.Annotations[annotationValidationSession])
 		Expect(err).NotTo(HaveOccurred())
-		Expect(entries).To(ConsistOf(sessionEntry{Name: pending.Name, Tests: []string{"basic"}}))
+		allowed := true
+		Expect(entries).To(ConsistOf(sessionEntry{
+			Name: pending.Name, Tests: []string{"basic"}, CordonReleaseAllowed: &allowed,
+		}))
 	})
 
 	It("skips a node recreated under the same name, which holds no session entry, at release", func() {
