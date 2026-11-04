@@ -17,6 +17,7 @@ package evaluator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -65,17 +66,32 @@ func (i *nodeSelectorInformers) FindEvictablePodsInNamespaceAndNode(context.Cont
 }
 
 type countingCustomDrainClient struct {
-	existsCalls int
+	statusCalls     int
+	staleExists     bool
+	staleComplete   bool
+	currentExists   bool
+	currentComplete bool
 }
 
-// ExistsForNode reports no CR yet, which makes custom drain ask for one to be created.
-func (c *countingCustomDrainClient) ExistsForNode(context.Context, string) (bool, bool, error) {
-	c.existsCalls++
-	return false, false, nil
+func (c *countingCustomDrainClient) GetCRStatus(_ context.Context, name string) (bool, bool, error) {
+	c.statusCalls++
+	if name == "drain-worker-old-event" {
+		return c.staleExists, c.staleComplete, nil
+	}
+	return c.currentExists, c.currentComplete, nil
 }
 
-func (c *countingCustomDrainClient) GetCRStatus(context.Context, string) (bool, bool, error) {
-	return false, false, nil
+func TestCustomDrainDoesNotReuseRequestsFromOtherEvents(t *testing.T) {
+	for _, complete := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stale_complete_%t", complete), func(t *testing.T) {
+			evaluator, client := newNodeSelectorEvaluator(t, "", nil)
+			client.staleExists = true
+			client.staleComplete = complete
+			result, err := evaluator.EvaluateEventWithDatabase(t.Context(), quarantinedEvent("worker"), nil, nil)
+			require.NoError(t, err)
+			require.Equal(t, ActionCreateCR, result.Action)
+		})
+	}
 }
 
 // newNodeSelectorEvaluator builds an evaluator whose custom drain is scoped by nodeSelector.
@@ -150,10 +166,10 @@ func TestEvaluateEventWithDatabase_NodeSelector_RoutesEachNodeToItsDrainPath(t *
 
 			if tt.customDrain {
 				require.Equal(t, ActionCreateCR, result.Action)
-				require.Equal(t, 1, client.existsCalls)
+				require.Equal(t, 1, client.statusCalls)
 			} else {
 				require.NotEqual(t, ActionCreateCR, result.Action)
-				require.Zero(t, client.existsCalls)
+				require.Zero(t, client.statusCalls)
 			}
 		})
 	}
@@ -168,7 +184,7 @@ func TestEvaluateEventWithDatabase_NodeMissingFromCache_RetriesInsteadOfGuessing
 	require.NoError(t, err)
 	require.Equal(t, ActionWait, result.Action)
 	require.Equal(t, time.Minute, result.WaitDelay)
-	require.Zero(t, client.existsCalls)
+	require.Zero(t, client.statusCalls)
 }
 
 // TestEvaluateEventWithDatabase_NoNodeSelector_SendsEveryNodeToCustomDrain
@@ -180,5 +196,22 @@ func TestEvaluateEventWithDatabase_NoNodeSelector_SendsEveryNodeToCustomDrain(t 
 	result, err := evaluator.EvaluateEventWithDatabase(t.Context(), quarantinedEvent("absent-node"), nil, nil)
 	require.NoError(t, err)
 	require.Equal(t, ActionCreateCR, result.Action)
-	require.Equal(t, 1, client.existsCalls)
+	require.Equal(t, 1, client.statusCalls)
+}
+
+func TestCustomDrainCurrentRequest(t *testing.T) {
+	for _, complete := range []bool{false, true} {
+		t.Run(fmt.Sprintf("complete_%t", complete), func(t *testing.T) {
+			evaluator, client := newNodeSelectorEvaluator(t, "", nil)
+			client.currentExists = true
+			client.currentComplete = complete
+			result, err := evaluator.EvaluateEventWithDatabase(t.Context(), quarantinedEvent("worker"), nil, nil)
+			require.NoError(t, err)
+			if complete {
+				require.Equal(t, ActionMarkAlreadyDrained, result.Action)
+			} else {
+				require.Equal(t, ActionWait, result.Action)
+			}
+		})
+	}
 }
