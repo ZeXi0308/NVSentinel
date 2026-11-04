@@ -140,43 +140,6 @@ func (c *Client) CreateDrainCR(ctx context.Context, data TemplateData) (string, 
 	return crName, nil
 }
 
-// ExistsForNode checks if any drain CR exists for the given node.
-// Returns (exists, drainComplete, error).
-func (c *Client) ExistsForNode(ctx context.Context, nodeName string) (bool, bool, error) {
-	gvk := schema.GroupVersionKind{
-		Group:   c.config.ApiGroup,
-		Version: c.config.Version,
-		Kind:    c.config.Kind,
-	}
-
-	mapping, err := c.restMapper.RESTMapping(gvk.GroupKind(), gvk.Version)
-	if err != nil {
-		return false, false, fmt.Errorf("failed to get REST mapping for %s: %w", gvk, err)
-	}
-
-	selector := fmt.Sprintf("%s=%s", NodeNameLabelKey, nodeName)
-
-	list, err := c.dynamicClient.
-		Resource(mapping.Resource).
-		Namespace(c.config.Namespace).
-		List(ctx, metav1.ListOptions{LabelSelector: selector})
-	if err != nil {
-		return false, false, fmt.Errorf("failed to list drain CRs for node %s: %w", nodeName, err)
-	}
-
-	if len(list.Items) == 0 {
-		return false, false, nil
-	}
-
-	for _, item := range list.Items {
-		if !c.isCRComplete(item) {
-			return true, false, nil
-		}
-	}
-
-	return true, true, nil
-}
-
 func (c *Client) isCRComplete(cr unstructured.Unstructured) bool {
 	conditions, found, err := unstructured.NestedSlice(cr.Object, "status", "conditions")
 	if err != nil || !found {
@@ -186,6 +149,15 @@ func (c *Client) isCRComplete(cr unstructured.Unstructured) bool {
 	for _, cond := range conditions {
 		condMap, ok := cond.(map[string]any)
 		if ok && c.matchesCondition(condMap) {
+			// Plugins that publish observedGeneration must acknowledge this spec.
+			// Older custom-drain integrations may omit it.
+			if _, present := condMap["observedGeneration"]; present {
+				generation, _, err := unstructured.NestedInt64(condMap, "observedGeneration")
+				if err != nil || generation != cr.GetGeneration() {
+					continue
+				}
+			}
+
 			return true
 		}
 	}

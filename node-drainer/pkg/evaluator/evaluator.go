@@ -450,37 +450,6 @@ func (e *NodeDrainEvaluator) evaluateCustomDrain(ctx context.Context, healthEven
 
 	crName := customdrain.GenerateCRName(nodeName, eventID)
 
-	nodeHasCR, nodeDrainComplete, err := e.customDrainClient.ExistsForNode(ctx, nodeName)
-	if err != nil {
-		slog.ErrorContext(ctx, "Failed to check if any drain CR exists for node",
-			"node", nodeName,
-			"error", err)
-
-		return &DrainActionResult{
-			Action:    ActionWait,
-			WaitDelay: customDrainPollInterval,
-		}, nil
-	}
-
-	if !nodeHasCR {
-		systemNamespaces := e.config.SystemNamespaces
-
-		namespaces, err := e.informers.GetNamespacesMatchingPattern(ctx, "*", systemNamespaces, nodeName)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get user namespaces: %w", err)
-		}
-
-		slog.InfoContext(ctx, "Creating custom drain CR",
-			"node", nodeName,
-			"crName", crName)
-
-		return &DrainActionResult{
-			Action:             ActionCreateCR,
-			Namespaces:         namespaces,
-			PartialDrainEntity: partialDrainEntity,
-		}, nil
-	}
-
 	crExists, isComplete, err := e.customDrainClient.GetCRStatus(ctx, crName)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to get drain CR status",
@@ -501,22 +470,18 @@ func (e *NodeDrainEvaluator) evaluateCustomDrain(ctx context.Context, healthEven
 	}
 
 	if !crExists {
-		if nodeDrainComplete {
-			slog.InfoContext(ctx, "Another drain CR completed for this node, marking as already drained",
-				"node", nodeName)
-
-			return &DrainActionResult{
-				Action: ActionMarkAlreadyDrained,
-				Status: model.AlreadyDrained,
-			}, nil
+		// Cross-event reuse is decided by handleAlreadyQuarantined using the
+		// current quarantine's event set and drain scope. A leftover CR alone
+		// supplies neither, whether it is complete or still pending.
+		namespaces, err := e.informers.GetNamespacesMatchingPattern(ctx, "*", e.config.SystemNamespaces, nodeName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get user namespaces: %w", err)
 		}
 
-		slog.InfoContext(ctx, "Another drain CR is in progress for this node, waiting",
-			"node", nodeName)
-
 		return &DrainActionResult{
-			Action:    ActionWait,
-			WaitDelay: customDrainPollInterval,
+			Action:             ActionCreateCR,
+			Namespaces:         namespaces,
+			PartialDrainEntity: partialDrainEntity,
 		}, nil
 	}
 
