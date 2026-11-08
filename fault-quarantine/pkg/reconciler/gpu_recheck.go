@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -29,14 +30,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
+	"k8s.io/apimachinery/pkg/util/wait"
 
 	"github.com/nvidia/nvsentinel/commons/pkg/statemanager"
 	"github.com/nvidia/nvsentinel/data-models/pkg/model"
 	"github.com/nvidia/nvsentinel/data-models/pkg/protos"
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/common"
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/config"
+	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/evaluator"
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/healthEventsAnnotation"
+	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/informer"
 )
 
 const (
@@ -53,24 +56,24 @@ type gpuRecheckRequest struct {
 	NodeUID    string   `json:"nodeUID"`
 	ErrorCodes []string `json:"errorCodes"`
 }
+
 type gpuRecheckEnrollment struct {
 	request gpuRecheckRequest
 	skipped bool
 	podUID  types.UID
 	podName string
-	// Successful effects are remembered until scope exit. Completing a repair
-	// does not issue another request or accept a delayed duplicate.
-	effects map[string]string
+	handled bool
 }
+
 type gpuRechecker struct {
-	client   kubernetes.Interface
+	client   *informer.FaultQuarantineClient
 	config   config.GPUHealthRecheck
 	selector labels.Selector
 	mu       sync.Mutex
 	enrolled map[string]*gpuRecheckEnrollment
 }
 
-func newGPURechecker(client kubernetes.Interface, cfg config.GPUHealthRecheck) (*gpuRechecker, error) {
+func newGPURechecker(client *informer.FaultQuarantineClient, cfg config.GPUHealthRecheck) (*gpuRechecker, error) {
 	if cfg.NodeSelector == "" || cfg.Namespace == "" || cfg.PodSelector == "" {
 		return nil, fmt.Errorf("gpuHealthRecheck requires nodeSelector, namespace and podSelector")
 	}
@@ -92,53 +95,35 @@ func newGPURechecker(client kubernetes.Interface, cfg config.GPUHealthRecheck) (
 }
 
 func (c *gpuRechecker) run(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
+	wait.UntilWithContext(ctx, func(ctx context.Context) {
 		attempt, cancel := context.WithTimeout(ctx, 30*time.Second)
-		err := c.reconcile(attempt)
+		defer cancel()
 
-		cancel()
-
-		if err != nil && ctx.Err() == nil {
+		if err := c.reconcile(attempt); err != nil && ctx.Err() == nil {
 			slog.ErrorContext(ctx, "GPU health recheck enrollment failed", "error", err)
 		}
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
+	}, 30*time.Second)
 }
 
-// Reconcile membership, not fault history. Monitor callbacks provide the new
-// observation through the ordinary health-event stream.
+// The existing informer supplies membership. Only enrollments still waiting for
+// a monitor make API calls; completing repair does not rearm an enrollment.
+// This opt-in requester supports one FQ replica.
 func (c *gpuRechecker) reconcile(ctx context.Context) error {
-	nodes, err := c.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{LabelSelector: c.config.NodeSelector})
+	nodes, err := c.client.NodeInformer.Lister().List(c.selector)
 	if err != nil {
-		return fmt.Errorf("list recheck nodes: %w", err)
-	}
-
-	pods, err := c.client.CoreV1().Pods(c.config.Namespace).List(ctx,
-		metav1.ListOptions{LabelSelector: c.config.PodSelector})
-	if err != nil {
-		return fmt.Errorf("list GPU monitors: %w", err)
+		return fmt.Errorf("list cached recheck nodes: %w", err)
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	present := make(map[string]bool, len(nodes.Items))
+	present := make(map[string]bool, len(nodes))
 
 	var failures []error
 
-	for i := range nodes.Items {
-		node := &nodes.Items[i]
-
+	for _, node := range nodes {
 		present[node.Name] = true
-		if err := c.enroll(ctx, node, pods.Items); err != nil {
+		if err := c.enroll(ctx, node); err != nil {
 			failures = append(failures, err)
 		}
 	}
@@ -152,12 +137,12 @@ func (c *gpuRechecker) reconcile(ctx context.Context) error {
 	return errors.Join(failures...)
 }
 
-func (c *gpuRechecker) enroll(ctx context.Context, node *corev1.Node, pods []corev1.Pod) error {
+func (c *gpuRechecker) enroll(ctx context.Context, node *corev1.Node) error {
 	entry := c.enrolled[node.Name]
 	if entry == nil || entry.request.NodeUID != string(node.UID) {
 		entry = &gpuRecheckEnrollment{
 			request: gpuRecheckRequest{ID: rand.Text(), NodeUID: string(node.UID), ErrorCodes: []string{gpuRecheckECC}},
-			skipped: !recheckEligible(node), effects: make(map[string]string),
+			skipped: !recheckEligible(node),
 		}
 		c.enrolled[node.Name] = entry
 	}
@@ -165,19 +150,50 @@ func (c *gpuRechecker) enroll(ctx context.Context, node *corev1.Node, pods []cor
 	if entry.skipped || entry.podUID != "" {
 		return nil
 	}
-	// Clearing a hold or finishing repair does not rearm the enrollment.
-	if !recheckEligible(node) {
+
+	return c.request(ctx, node, entry)
+}
+
+func (c *gpuRechecker) request(ctx context.Context, node *corev1.Node, entry *gpuRecheckEnrollment) error {
+	current, err := c.client.Clientset.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("read recheck node: %w", err)
+	}
+
+	if current.UID != node.UID || !c.selector.Matches(labels.Set(current.Labels)) || !recheckEligible(current) {
 		entry.skipped = true
 		return nil
 	}
 
-	pod := recheckMonitorPod(node.Name, pods)
+	pods, err := c.client.Clientset.CoreV1().Pods(c.config.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: c.config.PodSelector, FieldSelector: "spec.nodeName=" + node.Name,
+	})
+	if err != nil {
+		return fmt.Errorf("list GPU monitor on %s: %w", node.Name, err)
+	}
+
+	pod := recheckMonitorPod(node.Name, pods.Items)
 	if pod == nil {
 		return nil
 	}
 
-	if err := c.writeRequest(ctx, pod, entry.request); err != nil {
-		return err
+	raw, err := json.Marshal(entry.request)
+	if err != nil {
+		return fmt.Errorf("encode GPU recheck request: %w", err)
+	}
+
+	patch, err := json.Marshal(map[string]any{"metadata": map[string]any{
+		"uid": pod.UID, "resourceVersion": pod.ResourceVersion,
+		"annotations": map[string]string{gpuRecheckAnnotation: string(raw)},
+	}})
+	if err != nil {
+		return fmt.Errorf("encode GPU recheck patch: %w", err)
+	}
+
+	_, err = c.client.Clientset.CoreV1().Pods(pod.Namespace).Patch(
+		ctx, pod.Name, types.MergePatchType, patch, metav1.PatchOptions{})
+	if err != nil {
+		return fmt.Errorf("request GPU recheck on %s: %w", node.Name, err)
 	}
 
 	entry.podUID, entry.podName = pod.UID, pod.Name
@@ -193,17 +209,14 @@ func recheckMonitorPod(nodeName string, pods []corev1.Pod) *corev1.Pod {
 		pod := &pods[i]
 
 		owner := metav1.GetControllerOf(pod)
-		if pod.Spec.NodeName != nodeName || pod.DeletionTimestamp != nil || owner == nil {
-			continue
-		}
-
-		if owner.Kind != "DaemonSet" || owner.APIVersion != "apps/v1" {
+		if pod.Spec.NodeName != nodeName || pod.DeletionTimestamp != nil || owner == nil ||
+			owner.Kind != "DaemonSet" || owner.APIVersion != "apps/v1" {
 			continue
 		}
 
 		if candidate != nil {
-			return nil
-		} // Wait for a monitor rollout to settle.
+			return nil // Wait for a monitor rollout to settle.
+		}
 
 		candidate = pod
 	}
@@ -211,144 +224,83 @@ func recheckMonitorPod(nodeName string, pods []corev1.Pod) *corev1.Pod {
 	return candidate
 }
 
-func (c *gpuRechecker) writeRequest(ctx context.Context, pod *corev1.Pod, request gpuRecheckRequest) error {
-	raw, err := json.Marshal(request)
-	if err != nil {
-		return fmt.Errorf("encode GPU recheck request: %w", err)
-	}
-
-	patch, err := json.Marshal(map[string]any{"metadata": map[string]any{
-		"uid": pod.UID, "resourceVersion": pod.ResourceVersion,
-		"annotations": map[string]string{gpuRecheckAnnotation: string(raw)},
-	}})
-	if err != nil {
-		return fmt.Errorf("encode GPU recheck patch: %w", err)
-	}
-
-	_, err = c.client.CoreV1().Pods(pod.Namespace).Patch(ctx, pod.Name, types.MergePatchType, patch, metav1.PatchOptions{})
-	if err != nil {
-		return fmt.Errorf("request GPU recheck on %s: %w", pod.Spec.NodeName, err)
-	}
-
-	return nil
-}
-
 func recheckManualHold(node *corev1.Node) bool {
 	return node.DeletionTimestamp != nil ||
 		node.Annotations[common.QuarantinedNodeUncordonedManuallyAnnotationKey] != "" ||
 		node.Annotations[common.QuarantinedNodeIsUntaintedManuallyAnnotationKey] != ""
 }
+
 func recheckEligible(node *corev1.Node) bool {
 	return !recheckManualHold(node) && !node.Spec.Unschedulable &&
 		node.Labels[statemanager.NVSentinelStateLabelKey] == "" &&
 		isEmptyHealthEventAnnotation(node.Annotations[common.QuarantineHealthEventAnnotationKey])
 }
-func recheckEffects(event *protos.HealthEvent) []string {
-	var keys []string
 
-	for _, entity := range event.EntitiesImpacted {
-		if entity.EntityType == "GPU" && entity.EntityValue != "" {
-			keys = append(keys, entity.EntityValue)
-		}
-	}
-
-	return keys
-}
-func recheckLinked(node *corev1.Node, event *protos.HealthEvent) bool {
+// The quarantine annotation already owns per-GPU deduplication and recovery.
+// Use it to recognize this repair, including after an FQ restart.
+func recheckRecorded(node *corev1.Node, event *protos.HealthEvent) (linked, sameRequest bool) {
 	events := healthEventsAnnotation.NewHealthEventsAnnotationMap()
-
-	raw := node.Annotations[common.QuarantineHealthEventAnnotationKey]
-	if event.Id == "" || json.Unmarshal([]byte(raw), events) != nil {
-		return false
+	if json.Unmarshal([]byte(node.Annotations[common.QuarantineHealthEventAnnotationKey]), events) != nil {
+		return false, false
 	}
 
 	for _, current := range events.Events {
-		if current.Id == event.Id {
-			return true
-		}
+		linked = linked || current.Id == event.Id
+		sameRequest = sameRequest || (current.Metadata[gpuRecheckRequestKey] == event.Metadata[gpuRecheckRequestKey] &&
+			current.Metadata[gpuRecheckNodeKey] == event.Metadata[gpuRecheckNodeKey])
 	}
 
-	return false
+	return linked, sameRequest
 }
 
-// Called again inside the optimistic node patch, against the exact Node being
-// changed, so a concurrent scope/UID/manual-hold change cannot pass a stale read.
+// Runs again against the live Node inside the optimistic quarantine patch.
+// A nil requester permits only recovery of an already-recorded event.
 func (c *gpuRechecker) guard(node *corev1.Node, event *protos.HealthEvent) error {
-	if !c.selector.Matches(labels.Set(node.Labels)) || !recheckIdentityValid(node, event) {
+	if string(node.UID) != event.Metadata[gpuRecheckNodeKey] || recheckManualHold(node) ||
+		(c != nil && !c.selector.Matches(labels.Set(node.Labels))) {
 		return errStaleGPURecheck
 	}
 
-	if recheckLinked(node, event) {
+	linked, sameRequest := recheckRecorded(node, event)
+	if linked {
 		return nil
-	} // Resume an already recorded quarantine after controller restart.
+	}
+
+	if c == nil {
+		return errStaleGPURecheck
+	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	entry := c.enrolled[node.Name]
+	return c.enrolled[node.Name].accepts(node, event, sameRequest)
+}
+
+func (entry *gpuRecheckEnrollment) accepts(node *corev1.Node, event *protos.HealthEvent, sameRequest bool) error {
 	if entry == nil || entry.skipped || entry.podUID == "" || entry.request.ID != event.Metadata[gpuRecheckRequestKey] {
 		return errStaleGPURecheck
 	}
 
-	return entry.accepts(node, event)
-}
-
-func recheckIdentityValid(node *corev1.Node, event *protos.HealthEvent) bool {
-	return string(node.UID) == event.Metadata[gpuRecheckNodeKey] && !recheckManualHold(node)
-}
-
-func (entry *gpuRecheckEnrollment) accepts(node *corev1.Node, event *protos.HealthEvent) error {
-	if len(entry.effects) == 0 {
-		if !recheckEligible(node) {
-			return errStaleGPURecheck
-		}
-	} else if isEmptyHealthEventAnnotation(node.Annotations[common.QuarantineHealthEventAnnotationKey]) {
-		return errStaleGPURecheck // Repair finished or an operator released it.
-	}
-
-	for _, key := range recheckEffects(event) {
-		if entry.effects[key] != "" {
-			return errStaleGPURecheck
-		}
-	}
-
-	return nil
-}
-func (c *gpuRechecker) validate(ctx context.Context, event *protos.HealthEvent) error {
-	if !recheckPayloadValid(event) {
-		return errStaleGPURecheck
-	}
-
-	node, err := c.client.CoreV1().Nodes().Get(ctx, event.NodeName, metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		return errStaleGPURecheck
-	}
-
-	if err != nil {
-		return fmt.Errorf("read GPU recheck node: %w", err)
-	}
-
-	if err := c.guard(node, event); err != nil {
-		return err
-	}
-
-	if recheckLinked(node, event) {
+	if (!entry.handled && recheckEligible(node)) || sameRequest {
 		return nil
 	}
 
-	return c.validateMonitor(ctx, node, event)
+	return errStaleGPURecheck
 }
 
 func recheckPayloadValid(event *protos.HealthEvent) bool {
 	return event.Id != "" && event.Agent == "gpu-health-monitor" && event.CheckName == "GpuMemWatch" &&
 		!event.IsHealthy && event.IsFatal && event.ProcessingStrategy == protos.ProcessingStrategy_EXECUTE_REMEDIATION &&
-		len(event.ErrorCode) == 1 && event.ErrorCode[0] == gpuRecheckECC && len(recheckEffects(event)) > 0
+		slices.Equal(event.ErrorCode, []string{gpuRecheckECC}) &&
+		len(event.EntitiesImpacted) > 0 && !slices.ContainsFunc(event.EntitiesImpacted, func(e *protos.Entity) bool {
+		return e.GetEntityType() != "GPU" || e.GetEntityValue() == ""
+	})
 }
 
-func (c *gpuRechecker) validateMonitor(ctx context.Context, node *corev1.Node, event *protos.HealthEvent) error {
+func (c *gpuRechecker) validateMonitor(ctx context.Context, event *protos.HealthEvent) error {
 	c.mu.Lock()
 
-	entry := c.enrolled[node.Name]
+	entry := c.enrolled[event.NodeName]
 	if entry == nil {
 		c.mu.Unlock()
 		return errStaleGPURecheck
@@ -357,7 +309,7 @@ func (c *gpuRechecker) validateMonitor(ctx context.Context, node *corev1.Node, e
 	podName, podUID := entry.podName, entry.podUID
 	c.mu.Unlock()
 
-	pod, err := c.client.CoreV1().Pods(c.config.Namespace).Get(ctx, podName, metav1.GetOptions{})
+	pod, err := c.client.Clientset.CoreV1().Pods(c.config.Namespace).Get(ctx, podName, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return errStaleGPURecheck
 	}
@@ -367,23 +319,21 @@ func (c *gpuRechecker) validateMonitor(ctx context.Context, node *corev1.Node, e
 	}
 
 	var request gpuRecheckRequest
-	if pod.UID != podUID || pod.DeletionTimestamp != nil || pod.Spec.NodeName != node.Name ||
+	if pod.UID != podUID || pod.DeletionTimestamp != nil || pod.Spec.NodeName != event.NodeName ||
 		json.Unmarshal([]byte(pod.Annotations[gpuRecheckAnnotation]), &request) != nil ||
-		request.ID != event.Metadata[gpuRecheckRequestKey] || request.NodeUID != string(node.UID) {
+		request.ID != event.Metadata[gpuRecheckRequestKey] || request.NodeUID != event.Metadata[gpuRecheckNodeKey] {
 		return errStaleGPURecheck
 	}
 
 	return nil
 }
+
 func (c *gpuRechecker) complete(event *protos.HealthEvent) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	entry := c.enrolled[event.NodeName]
-	if entry != nil && entry.request.ID == event.Metadata[gpuRecheckRequestKey] {
-		for _, key := range recheckEffects(event) {
-			entry.effects[key] = event.Id
-		}
+	if entry := c.enrolled[event.NodeName]; entry != nil && entry.request.ID == event.Metadata[gpuRecheckRequestKey] {
+		entry.handled = true
 	}
 }
 
@@ -394,7 +344,7 @@ func (r *Reconciler) initializeGPURecheck() error {
 
 	var err error
 
-	r.gpuRecheck, err = newGPURechecker(r.k8sClient.Clientset, r.config.TomlConfig.GPUHealthRecheck)
+	r.gpuRecheck, err = newGPURechecker(r.k8sClient, r.config.TomlConfig.GPUHealthRecheck)
 
 	return err
 }
@@ -404,27 +354,8 @@ func (r *Reconciler) gpuRecheckGuard(ctx context.Context, event *protos.HealthEv
 		return nil, nil
 	}
 
-	if r.gpuRecheck == nil {
-		return r.recordedRecheckGuard(ctx, event)
-	}
-
-	if err := r.gpuRecheck.validate(ctx, event); err != nil {
-		return nil, err
-	}
-
-	return func(node *corev1.Node) error { return r.gpuRecheck.guard(node, event) }, nil
-}
-
-// Turning off new requests preserves recovery of already recorded quarantines.
-func (r *Reconciler) recordedRecheckGuard(
-	ctx context.Context, event *protos.HealthEvent,
-) (func(*corev1.Node) error, error) {
-	guard := func(node *corev1.Node) error {
-		if !recheckIdentityValid(node, event) || !recheckLinked(node, event) {
-			return errStaleGPURecheck
-		}
-
-		return nil
+	if !recheckPayloadValid(event) {
+		return nil, errStaleGPURecheck
 	}
 
 	node, err := r.k8sClient.Clientset.CoreV1().Nodes().Get(ctx, event.NodeName, metav1.GetOptions{})
@@ -433,21 +364,40 @@ func (r *Reconciler) recordedRecheckGuard(
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("read recorded GPU recheck: %w", err)
+		return nil, fmt.Errorf("read GPU recheck node: %w", err)
 	}
 
-	return guard, guard(node)
+	guard := func(node *corev1.Node) error { return r.gpuRecheck.guard(node, event) }
+	if err := guard(node); err != nil {
+		return nil, err
+	}
+
+	if linked, _ := recheckRecorded(node, event); !linked {
+		if err := r.gpuRecheck.validateMonitor(ctx, event); err != nil {
+			return nil, err
+		}
+	}
+
+	return guard, nil
 }
 
-func (r *Reconciler) finishGPURecheck(
-	event *protos.HealthEvent, status *model.Status, err error,
+func (r *Reconciler) handleEventWithGPURecheck(
+	ctx context.Context, event *model.HealthEventWithStatus,
+	evals []evaluator.RuleSetEvaluatorIface, rules rulesetsConfig,
 ) (*model.Status, error) {
-	if errors.Is(err, errStaleGPURecheck) {
-		return nil, nil
+	guard, err := r.gpuRecheckGuard(ctx, event.HealthEvent)
+
+	var status *model.Status
+
+	if err == nil {
+		status, err = r.handleEvent(informer.WithNodeGuard(ctx, guard), event, evals, rules)
+		if err == nil && guard != nil && r.gpuRecheck != nil {
+			r.gpuRecheck.complete(event.HealthEvent)
+		}
 	}
 
-	if err == nil && r.gpuRecheck != nil && event.Metadata[gpuRecheckRequestKey] != "" {
-		r.gpuRecheck.complete(event)
+	if errors.Is(err, errStaleGPURecheck) {
+		return nil, nil
 	}
 
 	return status, err

@@ -80,6 +80,16 @@ func transformLabels(t *testing.T, keys Keys, labels map[string]string) map[stri
 	return cached.Labels
 }
 
+func TestDerive_RecheckSelectorRetainsMembership(t *testing.T) {
+	cfg := config.TomlConfig{GPUHealthRecheck: config.GPUHealthRecheck{
+		Enabled: true, NodeSelector: "repair=true,pool in (training,shared),!excluded",
+	}}
+	keys := Derive(cfg, testOperational())
+	for _, key := range []string{"repair", "pool", "excluded"} {
+		require.Contains(t, keys.labels, key)
+	}
+}
+
 func TestDerive_ShippedPredicate_RetainsOnlyTheGuardedKeys(t *testing.T) {
 	keys := Derive(nodeRuleConfig(shippedPredicate), testOperational())
 

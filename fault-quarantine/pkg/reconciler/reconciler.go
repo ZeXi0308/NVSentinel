@@ -605,21 +605,9 @@ func (r *Reconciler) ProcessEvent(
 		return nil, err
 	}
 
-	guard, err := r.gpuRecheckGuard(ctx, event.HealthEvent)
-	if errors.Is(err, errStaleGPURecheck) {
-		return nil, nil
-	}
-
-	if err != nil {
-		return nil, err
-	}
-
-	ctx = informer.WithNodeGuard(ctx, guard)
-
 	slog.DebugContext(ctx, "Processing event", "checkName", event.HealthEvent.CheckName)
 
-	isNodeQuarantined, err := r.handleEvent(ctx, event, ruleSetEvals, rulesetsConfig)
-	isNodeQuarantined, err = r.finishGPURecheck(event.HealthEvent, isNodeQuarantined, err)
+	isNodeQuarantined, err := r.handleEventWithGPURecheck(ctx, event, ruleSetEvals, rulesetsConfig)
 
 	if isNodeQuarantined == nil {
 		slog.DebugContext(ctx, "Skipped processing event for node, no status update needed",
