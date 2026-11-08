@@ -31,6 +31,7 @@ from google.protobuf.timestamp_pb2 import Timestamp
 import grpc
 from . import direct_publisher as direct_publisher_mod
 from . import metrics
+from .fault_recheck import ECC_ERROR, MEMORY_WATCH, FaultRecheck
 import time
 from time import monotonic, sleep
 
@@ -139,6 +140,7 @@ class PlatformConnectorConfig:
     # How long DCGM must stay unreachable before a remote probe hang is
     # published, measured across liveness restarts. 0 publishes at once.
     connectivity_failure_window_seconds: float = 0.0
+    recheck_request_path: str | None = None
 
 
 class PlatformConnectorEventProcessor(dcgmtypes.CallbackInterface):
@@ -147,6 +149,7 @@ class PlatformConnectorEventProcessor(dcgmtypes.CallbackInterface):
         config: PlatformConnectorConfig,
         exit: Event,
     ) -> None:
+        self._recheck = FaultRecheck(config.recheck_request_path)
         self._exit = exit
         self._socket_path = config.socket_path
         # Projected ServiceAccount token presented as a bearer credential on
@@ -674,6 +677,7 @@ class PlatformConnectorEventProcessor(dcgmtypes.CallbackInterface):
             log.debug("received callback for health event")
             timestamp = Timestamp()
             timestamp.GetCurrentTime()
+            recheck = self._recheck.for_snapshot(health_details, gpu_ids)
 
             # First, check if we need to clear any previous connectivity failure events
             self.clear_dcgm_connectivity_failure(timestamp)
@@ -735,7 +739,14 @@ class PlatformConnectorEventProcessor(dcgmtypes.CallbackInterface):
                             key = self._build_cache_key(check_name, entity.entityType, entity.entityValue)
 
                             entry = pending_cache_updates.get(key, self.entity_cache.get(key))
-                            if entry is None or failure_details.code not in entry.active_errors:
+                            confirm_fault = (
+                                recheck is not None
+                                and watch_name == MEMORY_WATCH
+                                and failure_details.code == ECC_ERROR
+                                and isFatal
+                                and effective_strategy == platformconnector_pb2.EXECUTE_REMEDIATION
+                            )
+                            if entry is None or failure_details.code not in entry.active_errors or confirm_fault:
                                 existing_errors = set(entry.active_errors) if entry else set()
                                 existing_errors.add(failure_details.code)
                                 pending_cache_updates[key] = EntityCacheEntry(active_errors=existing_errors)
@@ -763,7 +774,7 @@ class PlatformConnectorEventProcessor(dcgmtypes.CallbackInterface):
                                     )
                                     recommended_action = platformconnector_pb2.RESTART_VM
 
-                                event_metadata = {}
+                                event_metadata = recheck.metadata() if confirm_fault else {}
                                 chassis_serial = self._metadata_reader.get_chassis_serial()
                                 if chassis_serial:
                                     event_metadata["chassis_serial"] = chassis_serial
@@ -987,6 +998,7 @@ class PlatformConnectorEventProcessor(dcgmtypes.CallbackInterface):
             if len(health_events):
                 try:
                     if self.send_health_event_with_retries(health_events):
+                        self._recheck.complete(recheck)
                         # Only update cache and metrics after successful send
                         for key, state in pending_cache_updates.items():
                             self.entity_cache[key] = state
@@ -1009,6 +1021,8 @@ class PlatformConnectorEventProcessor(dcgmtypes.CallbackInterface):
                             ).set(value)
                 except Exception as e:
                     log.error(f"Exception while sending health events: {e}")
+            else:
+                self._recheck.complete(recheck)
 
     def get_recommended_action_from_dcgm_error_map(self, error_code):
         if error_code in self.dcgm_errors_info_dict:

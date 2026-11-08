@@ -13,6 +13,12 @@
 # limitations under the License.
 
 global:
+  # Reconfirm current volatile double-bit ECC once on controller startup and
+  # node enrollment. Requires updated fault-quarantine and GPU monitor images.
+  gpuHealthRecheck:
+    enabled: false
+    # Required when enabled; match the quarantine/repair scope, including exclusions.
+    nodeSelector: ""
   dryRun: false
   image:
     tag: "main"

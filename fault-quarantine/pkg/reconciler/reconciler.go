@@ -97,6 +97,8 @@ type selectedLabel struct {
 }
 
 type Reconciler struct {
+	gpuRecheck                *gpuRechecker
+	gpuRecheckOnce            sync.Once
 	config                    ReconcilerConfig
 	k8sClient                 *informer.FaultQuarantineClient
 	lastProcessedObjectID     atomic.Value
@@ -193,6 +195,9 @@ func (r *Reconciler) SetReadinessChecker(checker *server.DatastoreReadinessCheck
 }
 
 func (r *Reconciler) Start(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	ds, err := datastore.NewDataStore(ctx, *r.config.DataStoreConfig)
 	if err != nil {
 		return fmt.Errorf("failed to create datastore: %w", err)
@@ -311,6 +316,10 @@ func (r *Reconciler) prepareEventProcessing(ctx context.Context,
 
 	r.initializeQuarantineMetrics(ctx)
 
+	if err := r.initializeGPURecheck(); err != nil {
+		return nil, rulesetsConfig{}, err
+	}
+
 	return ruleSetEvals, cfg, nil
 }
 
@@ -323,6 +332,10 @@ func (r *Reconciler) configureColdStart(
 ) {
 	if startFreshFromBreaker || startFreshFromResumeControl {
 		slog.InfoContext(ctx, "Skipping cold start because CREATE cursor mode was consumed")
+
+		if r.gpuRecheck != nil {
+			r.eventWatcher.SetColdStartCallback(r.startGPURecheck)
+		}
 
 		return
 	}
@@ -349,15 +362,23 @@ func (r *Reconciler) configureColdStart(
 		}
 
 		if !seedColdStartCutoff {
-			return nil
+			return r.startGPURecheck(ctx)
 		}
 
 		if err := r.setColdStartCutoff(ctx, r.config.TokenConfig.ClientName, coldStartUntil); err != nil {
 			return fmt.Errorf("failed to persist initial fault-quarantine cold-start cutoff: %w", err)
 		}
 
-		return nil
+		return r.startGPURecheck(ctx)
 	})
+}
+
+func (r *Reconciler) startGPURecheck(ctx context.Context) error {
+	if r.gpuRecheck != nil {
+		r.gpuRecheckOnce.Do(func() { go r.gpuRecheck.run(ctx) })
+	}
+
+	return nil
 }
 
 // setupChangeStreamWatcher creates and unwraps the change stream watcher
@@ -584,9 +605,21 @@ func (r *Reconciler) ProcessEvent(
 		return nil, err
 	}
 
+	guard, err := r.gpuRecheckGuard(ctx, event.HealthEvent)
+	if errors.Is(err, errStaleGPURecheck) {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	ctx = informer.WithNodeGuard(ctx, guard)
+
 	slog.DebugContext(ctx, "Processing event", "checkName", event.HealthEvent.CheckName)
 
 	isNodeQuarantined, err := r.handleEvent(ctx, event, ruleSetEvals, rulesetsConfig)
+	isNodeQuarantined, err = r.finishGPURecheck(event.HealthEvent, isNodeQuarantined, err)
 
 	if isNodeQuarantined == nil {
 		slog.DebugContext(ctx, "Skipped processing event for node, no status update needed",

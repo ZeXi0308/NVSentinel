@@ -97,9 +97,18 @@ type ValidationConfig struct {
 	PartialDrainEnabled bool `toml:"partialDrainEnabled"`
 }
 
+// GPUHealthRecheck requests a fresh volatile DBE check on enrollment or restart.
+type GPUHealthRecheck struct {
+	Enabled      bool   `toml:"enabled"`
+	NodeSelector string `toml:"nodeSelector"`
+	Namespace    string `toml:"namespace"`
+	PodSelector  string `toml:"podSelector"`
+}
+
 type TomlConfig struct {
-	LabelPrefix    string              `toml:"label-prefix"`
-	CircuitBreaker CircuitBreaker      `toml:"circuitBreaker"`
-	RuleSets       []QuarantineRuleSet `toml:"rule-sets"`
-	Validation     ValidationConfig    `toml:"validation"`
+	GPUHealthRecheck GPUHealthRecheck    `toml:"gpuHealthRecheck"`
+	LabelPrefix      string              `toml:"label-prefix"`
+	CircuitBreaker   CircuitBreaker      `toml:"circuitBreaker"`
+	RuleSets         []QuarantineRuleSet `toml:"rule-sets"`
+	Validation       ValidationConfig    `toml:"validation"`
 }

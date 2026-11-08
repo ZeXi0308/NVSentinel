@@ -205,11 +205,24 @@ func (c *FaultQuarantineClient) UpdateNode(ctx context.Context, nodeName string,
 
 	defer mu.(*sync.Mutex).Unlock()
 
+	cached := c.cachedNodeForPatch(nodeName)
+	if guard, ok := ctx.Value(nodeGuardContextKey{}).(func(*v1.Node) error); ok {
+		cached = nil // A recheck guard needs all current labels and annotations.
+		mutate := updateFn
+		updateFn = func(node *v1.Node) error {
+			if err := guard(node); err != nil {
+				return err
+			}
+
+			return mutate(node)
+		}
+	}
+
 	changed, err := c.nodePatcher.Patch(
 		ctx,
 		c.Clientset.CoreV1().Nodes(),
 		nodeName,
-		c.cachedNodeForPatch(nodeName),
+		cached,
 		updateFn,
 	)
 	if err != nil {
@@ -935,4 +948,15 @@ func (c *FaultQuarantineClient) updateNodeAnnotationsForManualUncordon(
 	}
 
 	maps.Copy(node.Annotations, annotationsToAdd)
+}
+
+type nodeGuardContextKey struct{}
+
+// WithNodeGuard checks a precondition against the live Node on every patch retry.
+func WithNodeGuard(ctx context.Context, guard func(*v1.Node) error) context.Context {
+	if guard == nil {
+		return ctx
+	}
+
+	return context.WithValue(ctx, nodeGuardContextKey{}, guard)
 }

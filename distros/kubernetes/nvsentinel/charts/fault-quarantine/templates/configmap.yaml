@@ -22,6 +22,16 @@ metadata:
 data:
   config.toml: |
     label-prefix = {{ .Values.labelPrefix | quote }}
+    {{- if include "fault-quarantine.gpuRecheckEnabled" . }}
+    {{- if ne (int .Values.replicaCount) 1 }}
+    {{- fail "gpuHealthRecheck requires one fault-quarantine replica" }}
+    {{- end }}
+    [gpuHealthRecheck]
+    enabled = true
+    nodeSelector = {{ .Values.global.gpuHealthRecheck.nodeSelector | quote }}
+    namespace = {{ .Release.Namespace | quote }}
+    podSelector = {{ printf "app.kubernetes.io/name=gpu-health-monitor,app.kubernetes.io/instance=%s" .Release.Name | quote }}
+    {{- end }}
     
     [circuitBreaker]
     percentage = {{ .Values.circuitBreaker.percentage }}
