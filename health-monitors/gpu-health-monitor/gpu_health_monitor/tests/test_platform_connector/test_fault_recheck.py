@@ -93,6 +93,11 @@ def test_persistent_fault_is_confirmed_once_after_request(recheck_processor):
     assert len(faults) == 2
     assert faults[-1].metadata["gpuRecheckRequest"] == "first"
     assert faults[-1].metadata["gpuRecheckNodeUID"] == "node-uid"
+    assert [(e.entityType, e.entityValue) for e in faults[-1].entitiesImpacted] == [
+        ("GPU", "0"),
+        ("PCI", "0000:18:00.0"),
+        ("GPU_UUID", "GPU-test"),
+    ]
     assert faults[-1].generatedTimestamp.ToNanoseconds() > faults[0].generatedTimestamp.ToNanoseconds()
     for _ in range(3):
         poll(processor)

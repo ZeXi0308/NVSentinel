@@ -292,9 +292,9 @@ func recheckPayloadValid(event *protos.HealthEvent) bool {
 	return event.Id != "" && event.Agent == "gpu-health-monitor" && event.CheckName == "GpuMemWatch" &&
 		!event.IsHealthy && event.IsFatal && event.ProcessingStrategy == protos.ProcessingStrategy_EXECUTE_REMEDIATION &&
 		slices.Equal(event.ErrorCode, []string{gpuRecheckECC}) &&
-		len(event.EntitiesImpacted) > 0 && !slices.ContainsFunc(event.EntitiesImpacted, func(e *protos.Entity) bool {
-		return e.GetEntityType() != "GPU" || e.GetEntityValue() == ""
-	})
+		slices.ContainsFunc(event.EntitiesImpacted, func(e *protos.Entity) bool {
+			return e.GetEntityType() == "GPU" && e.GetEntityValue() != ""
+		})
 }
 
 func (c *gpuRechecker) validateMonitor(ctx context.Context, event *protos.HealthEvent) error {

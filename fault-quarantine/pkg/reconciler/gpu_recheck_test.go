@@ -111,7 +111,41 @@ func issuedRecheckEvent(t *testing.T, ctx context.Context, c *gpuRechecker, node
 	require.NoError(t, err)
 	var request gpuRecheckRequest
 	require.NoError(t, json.Unmarshal([]byte(current.Annotations[gpuRecheckAnnotation]), &request))
-	return &protos.HealthEvent{Id: generateTestID(), Agent: "gpu-health-monitor", ComponentClass: "GPU", CheckName: "GpuMemWatch", IsFatal: true, NodeName: node.Name, ProcessingStrategy: protos.ProcessingStrategy_EXECUTE_REMEDIATION, ErrorCode: []string{gpuRecheckECC}, RecommendedAction: protos.RecommendedAction_COMPONENT_RESET, GeneratedTimestamp: timestamppb.Now(), EntitiesImpacted: []*protos.Entity{{EntityType: "GPU", EntityValue: "1"}}, Metadata: map[string]string{gpuRecheckRequestKey: request.ID, gpuRecheckNodeKey: request.NodeUID}}
+	return &protos.HealthEvent{Id: generateTestID(), Agent: "gpu-health-monitor", ComponentClass: "GPU", CheckName: "GpuMemWatch", IsFatal: true, NodeName: node.Name, ProcessingStrategy: protos.ProcessingStrategy_EXECUTE_REMEDIATION, ErrorCode: []string{gpuRecheckECC}, RecommendedAction: protos.RecommendedAction_COMPONENT_RESET, GeneratedTimestamp: timestamppb.Now(),
+		EntitiesImpacted: []*protos.Entity{
+			{EntityType: "GPU", EntityValue: "1"},
+			{EntityType: "PCI", EntityValue: "0000:18:00.0"},
+			{EntityType: "GPU_UUID", EntityValue: "GPU-test"},
+		},
+		Metadata: map[string]string{gpuRecheckRequestKey: request.ID, gpuRecheckNodeKey: request.NodeUID}}
+}
+
+func TestGPURecheckRequiresGPUIdentity(t *testing.T) {
+	ctx, c, node, pod := recheckFixture(t)
+	event := issuedRecheckEvent(t, ctx, c, node, pod)
+	for _, test := range []struct {
+		name     string
+		entities []*protos.Entity
+		valid    bool
+	}{
+		{"monitor identities", event.EntitiesImpacted, true},
+		{"GPU index only", event.EntitiesImpacted[:1], true},
+		{"PCI and UUID only", event.EntitiesImpacted[1:], false},
+		{"empty GPU index", []*protos.Entity{{EntityType: "GPU"}}, false},
+		{"no identities", nil, false},
+		{"nil identity", []*protos.Entity{nil}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			confirmation := proto.Clone(event).(*protos.HealthEvent)
+			confirmation.EntitiesImpacted = test.entities
+			err := validateRecheck(ctx, c, confirmation)
+			if test.valid {
+				require.NoError(t, err)
+			} else {
+				require.ErrorIs(t, err, errStaleGPURecheck)
+			}
+		})
+	}
 }
 
 func TestGPURecheckRejectsChangedScopeAndIdentity(t *testing.T) {
@@ -217,7 +251,11 @@ func TestGPURecheckUsesNormalQuarantineAndClosesCycle(t *testing.T) {
 	// Another GPU confirmed in the same request joins the same quarantine.
 	second := proto.Clone(event).(*protos.HealthEvent)
 	second.Id = generateTestID()
-	second.EntitiesImpacted = []*protos.Entity{{EntityType: "GPU", EntityValue: "2"}}
+	second.EntitiesImpacted = []*protos.Entity{
+		{EntityType: "GPU", EntityValue: "2"},
+		{EntityType: "PCI", EntityValue: "0000:19:00.0"},
+		{EntityType: "GPU_UUID", EntityValue: "GPU-test-2"},
+	}
 	require.NoError(t, validateRecheck(ctx, c, second))
 	require.Eventually(t, func() bool {
 		cached, err := r.k8sClient.NodeInformer.GetNode(node.Name)
