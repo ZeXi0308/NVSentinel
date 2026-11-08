@@ -63,6 +63,9 @@ class HealthDetails:
     # capacity can omit additional incidents, so it is not safe to infer that
     # an absent error code has recovered.
     is_complete: bool = True
+    # Monotonic time immediately before the hardware check, not callback delivery.
+    # Timing provenance is separate from equality of the observed health state.
+    observed_at: float = dataclasses.field(default=0.0, compare=False)
 
 
 @dataclasses.dataclass(frozen=True)

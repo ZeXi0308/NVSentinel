@@ -139,6 +139,13 @@ def _init_event_processor(
         "suppressed regardless of this flag."
     ),
 )
+@click.option(
+    "--recheck-request-path",
+    type=click.Path(),
+    default="",
+    envvar="GPU_HEALTH_RECHECK_FILE",
+    help="Downward API file containing a GPU fault recheck request; empty disables rechecks.",
+)
 def cli(
     dcgm_addr: str,
     dcgm_mode: str,
@@ -153,6 +160,7 @@ def cli(
     processing_strategy: str,
     platform_connector_token_path: str,
     suppress_nvlink_down_unbridged_pcie: bool,
+    recheck_request_path: str,
 ) -> None:
     exit = Event()
     config = configparser.ConfigParser()
@@ -327,6 +335,7 @@ def cli(
         connectivity_success_threshold=connectivity_success_threshold,
         connectivity_failure_window_seconds=connectivity_failure_window_seconds,
         token_path=platform_connector_token_path or None,
+        recheck_request_path=recheck_request_path or None,
     )
     enabled_event_processor_names = cli_config["EnabledEventProcessors"].split(",")
     enabled_event_processors = []

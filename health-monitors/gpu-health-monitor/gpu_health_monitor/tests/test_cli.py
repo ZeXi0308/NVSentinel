@@ -138,7 +138,7 @@ def test_cli_passes_configuration_to_watcher_and_processor(
             "--suppress-nvlink-down-unbridged-pcie",
             str(custom_settings),
         ],
-        env={"NODE_NAME": "test-node"},
+        env={"NODE_NAME": "test-node", "GPU_HEALTH_RECHECK_FILE": str(tmp_path / "recheck") if custom_settings else ""},
     )
     assert result.exit_code == 0, result.output or str(result.exception)
     (watcher,) = started
@@ -159,6 +159,7 @@ def test_cli_passes_configuration_to_watcher_and_processor(
     assert watcher._health_check_min_consecutive_polls == ({"DCGM_FR_NVLINK_DOWN": 3} if custom_settings else {})
     assert watcher._probe_watchdog._deadline_seconds == (23 if custom_settings else 51)
     (processor,) = watcher._callbacks
+    assert processor._recheck.path == (str(tmp_path / "recheck") if custom_settings else None)
     assert processor._node_name == "test-node"
     assert processor._socket_path == socket_path
     assert processor.state_file_path == str(state_file)

@@ -627,12 +627,15 @@ class DCGMWatcher:
             - health_status: dict of health details for each watch
             - connectivity_success: True if DCGM connection is successful, False otherwise
         """
+        observed_at = time.monotonic()
         try:
             with metrics.dcgm_api_latency.labels("health_check").time():
                 health_details = dcgm_group.health.Check()
             log.debug(f"initial health status is {health_details}")
 
             health_status = self._get_health_status_dict()
+            for details in health_status.values():
+                details.observed_at = observed_at
             incident_capacity = getattr(dcgm_structs, "DCGM_HEALTH_WATCH_MAX_INCIDENTS_V2", None)
             if incident_capacity is None:
                 incident_capacity = dcgm_structs.DCGM_HEALTH_WATCH_MAX_INCIDENTS

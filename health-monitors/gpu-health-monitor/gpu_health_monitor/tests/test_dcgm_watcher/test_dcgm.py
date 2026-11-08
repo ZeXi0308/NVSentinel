@@ -691,7 +691,17 @@ class TestDCGMHealthChecks:
         mock_response.incidents = dcgm_structs.c_dcgmIncidentInfo_t * dcgm_structs.DCGM_HEALTH_WATCH_MAX_INCIDENTS
         dcgm_group_mock.health.Check.return_value = mock_response()
 
+        before = time.monotonic()
+        check_started = []
+
+        def check():
+            check_started.append(time.monotonic())
+            return mock_response()
+
+        dcgm_group_mock.health.Check.side_effect = check
         response, connectivity_success = watcher._perform_health_check(dcgm_group_mock)
+        assert check_started
+        assert all(before <= details.observed_at <= check_started[0] for details in response.values())
         expected_response = watcher._get_health_status_dict()
         assert response == expected_response
         assert connectivity_success == True

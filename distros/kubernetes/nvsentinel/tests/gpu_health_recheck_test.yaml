@@ -1,0 +1,138 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+suite: GPU health recheck protocol wiring
+release:
+  name: nvsentinel
+  namespace: repair-system
+templates:
+  - charts/fault-quarantine/templates/configmap.yaml
+  - charts/fault-quarantine/templates/gpu-recheck-rbac.yaml
+  - charts/gpu-health-monitor/templates/configmap.yaml
+  - charts/gpu-health-monitor/templates/daemonset-dcgm-3.x.yaml
+  - charts/gpu-health-monitor/templates/daemonset-dcgm-4.x.yaml
+set:
+  global.faultQuarantine.enabled: true
+  global.gpuHealthMonitor.enabled: true
+tests:
+  - it: grants no Pod mutation permission by default
+    template: charts/fault-quarantine/templates/gpu-recheck-rbac.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+  - it: does not enable the requester by default
+    template: charts/fault-quarantine/templates/configmap.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: gpuHealthRecheck
+  - it: refuses enabling without an explicit node scope
+    template: charts/gpu-health-monitor/templates/daemonset-dcgm-4.x.yaml
+    set:
+      global.gpuHealthRecheck.enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: nodeSelector is required
+  - it: refuses string booleans
+    template: charts/gpu-health-monitor/templates/daemonset-dcgm-4.x.yaml
+    set:
+      global.gpuHealthRecheck.enabled: "false"
+    asserts:
+      - failedTemplate:
+          errorPattern: must be a boolean
+  - it: binds requester to the release namespace and selected repair scope
+    template: charts/fault-quarantine/templates/configmap.yaml
+    set:
+      global.gpuHealthRecheck.enabled: true
+      global.gpuHealthRecheck.nodeSelector: nvsentinel-repair-enabled=true
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'nodeSelector = "nvsentinel-repair-enabled=true"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'namespace = "repair-system"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'podSelector = "app.kubernetes.io/name=gpu-health-monitor,app.kubernetes.io/instance=nvsentinel"'
+  - it: scopes the new permission to monitor Pods in the release namespace
+    template: charts/fault-quarantine/templates/gpu-recheck-rbac.yaml
+    documentIndex: 0
+    set:
+      global.gpuHealthRecheck.enabled: true
+      global.gpuHealthRecheck.nodeSelector: repair=true
+    asserts:
+      - isKind:
+          of: Role
+      - equal:
+          path: metadata.namespace
+          value: repair-system
+      - equal:
+          path: rules
+          value:
+            - apiGroups: [""]
+              resources: [pods]
+              verbs: [get, list, patch]
+  - it: supplies a refreshing annotation file to DCGM 3
+    template: charts/gpu-health-monitor/templates/daemonset-dcgm-3.x.yaml
+    set:
+      global.gpuHealthRecheck.enabled: true
+      global.gpuHealthRecheck.nodeSelector: repair=true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GPU_HEALTH_RECHECK_FILE
+            value: /etc/gpu-recheck/request
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: gpu-recheck
+            mountPath: /etc/gpu-recheck
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: gpu-recheck
+            downwardAPI:
+              items:
+                - path: request
+                  fieldRef:
+                    fieldPath: metadata.annotations['nvsentinel.nvidia.com/gpu-health-recheck']
+  - it: supplies a refreshing annotation file to DCGM 4
+    template: charts/gpu-health-monitor/templates/daemonset-dcgm-4.x.yaml
+    set:
+      global.gpuHealthRecheck.enabled: true
+      global.gpuHealthRecheck.nodeSelector: repair=true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GPU_HEALTH_RECHECK_FILE
+            value: /etc/gpu-recheck/request
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: gpu-recheck
+            mountPath: /etc/gpu-recheck
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: gpu-recheck
+            downwardAPI:
+              items:
+                - path: request
+                  fieldRef:
+                    fieldPath: metadata.annotations['nvsentinel.nvidia.com/gpu-health-recheck']

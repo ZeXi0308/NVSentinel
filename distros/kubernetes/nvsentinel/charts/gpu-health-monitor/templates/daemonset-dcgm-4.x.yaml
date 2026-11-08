@@ -98,6 +98,11 @@ spec:
               port: {{ .Values.global.metricsPort }}
             {{- toYaml .Values.readinessProbe | nindent 12 }}
           volumeMounts:
+            {{- if include "gpu-health-monitor.gpuRecheckEnabled" . }}
+            - name: gpu-recheck
+              mountPath: /etc/gpu-recheck
+              readOnly: true
+            {{- end }}
             {{- if .Values.additionalVolumeMounts }}
             {{ toYaml .Values.additionalVolumeMounts | nindent 12 }}
             {{- end }}
@@ -115,6 +120,10 @@ spec:
             {{- . | nindent 12 }}
             {{- end }}
           env:
+            {{- if include "gpu-health-monitor.gpuRecheckEnabled" . }}
+            - name: GPU_HEALTH_RECHECK_FILE
+              value: /etc/gpu-recheck/request
+            {{- end }}
             - name: NODE_NAME
               valueFrom:
                 fieldRef:
@@ -130,6 +139,14 @@ spec:
             {{- . | nindent 12 }}
             {{- end }}
       volumes:
+        {{- if include "gpu-health-monitor.gpuRecheckEnabled" . }}
+        - name: gpu-recheck
+          downwardAPI:
+            items:
+              - path: request
+                fieldRef:
+                  fieldPath: metadata.annotations['nvsentinel.nvidia.com/gpu-health-recheck']
+        {{- end }}
         - name: config-vol
           configMap:
             name: {{ include "gpu-health-monitor.fullname" . }}
